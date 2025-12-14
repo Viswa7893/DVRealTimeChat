@@ -62,14 +62,14 @@ class AuthService: ObservableObject {
         guard httpResponse.statusCode == 200 else {
             // Print response for debugging
             if let jsonString = String(data: data, encoding: .utf8) {
-                print("❌ Server response: \(jsonString)")
+                print("âŒ Server response: \(jsonString)")
             }
             throw AuthError.serverError(httpResponse.statusCode)
         }
         
         // Debug: Print raw response
         if let jsonString = String(data: data, encoding: .utf8) {
-            print("📥 Register response: \(jsonString)")
+            print("ðŸ“¥ Register response: \(jsonString)")
         }
         
         let loginResponse = try decoder.decode(LoginResponse.self, from: data)
@@ -85,6 +85,8 @@ class AuthService: ObservableObject {
     
     // MARK: - Login
     func login(email: String, password: String) async throws -> UserResponse {
+        print("🌐 Making login request to: \(baseURL)/auth/login")
+        
         let url = URL(string: "\(baseURL)/auth/login")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -100,8 +102,11 @@ class AuthService: ObservableObject {
         let (data, response) = try await URLSession.shared.data(for: request)
         
         guard let httpResponse = response as? HTTPURLResponse else {
+            print("❌ Invalid response type")
             throw AuthError.invalidResponse
         }
+        
+        print("📡 HTTP Status Code: \(httpResponse.statusCode)")
         
         guard httpResponse.statusCode == 200 else {
             // Print response for debugging
@@ -124,6 +129,9 @@ class AuthService: ObservableObject {
         self.isAuthenticated = true
         UserDefaults.standard.set(loginResponse.token, forKey: "auth_token")
         
+        print("✅ AuthService updated - isAuthenticated: \(self.isAuthenticated)")
+        print("✅ Token saved to UserDefaults")
+        
         return loginResponse.user
     }
     
@@ -141,7 +149,7 @@ class AuthService: ObservableObject {
             self.currentUser = user
             self.isAuthenticated = true
         } catch {
-            print("❌ Failed to load current user: \(error)")
+            print("âŒ Failed to load current user: \(error)")
             self.logout()
         }
     }

@@ -97,14 +97,19 @@ struct RegisterView: View {
         errorMessage = nil
         isLoading = true
         
-        Task {
+        Task { @MainActor in
             do {
-                _ = try await authService.register(name: name, email: email, password: password)
+                print("📝 Attempting registration for: \(email)")
+                let user = try await authService.register(name: name, email: email, password: password)
+                print("✅ Registration successful for user: \(user.name)")
+                print("✅ Auth state - isAuthenticated: \(authService.isAuthenticated)")
+                isLoading = false
                 dismiss()
             } catch {
+                print("❌ Registration failed: \(error)")
                 errorMessage = error.localizedDescription
+                isLoading = false
             }
-            isLoading = false
         }
     }
 }

@@ -90,13 +90,19 @@ struct LoginView: View {
         errorMessage = nil
         isLoading = true
         
-        Task {
+        Task { @MainActor in
             do {
-                _ = try await authService.login(email: email, password: password)
+                print("🔐 Attempting login for: \(email)")
+                let user = try await authService.login(email: email, password: password)
+                print("✅ Login successful for user: \(user.name)")
+                print("✅ Auth state - isAuthenticated: \(authService.isAuthenticated)")
+                print("✅ Auth token exists: \(authService.authToken != nil)")
+                isLoading = false
             } catch {
+                print("❌ Login failed: \(error)")
                 errorMessage = error.localizedDescription
+                isLoading = false
             }
-            isLoading = false
         }
     }
 }
