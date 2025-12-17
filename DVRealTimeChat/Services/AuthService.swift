@@ -117,11 +117,13 @@ class AuthService: ObservableObject {
         }
         
         // Debug: Print raw response
-        if let jsonString = String(data: data, encoding: .utf8) {
-            print("📥 Login response: \(jsonString)")
+        if let prettyJSON = prettyPrintJSON(data) {
+            print("📥 Login response :\n\(prettyJSON)")
         }
+
         
         let loginResponse = try decoder.decode(LoginResponse.self, from: data)
+        objectWillChange.send()
         
         // Save token
         self.authToken = loginResponse.token
@@ -160,6 +162,20 @@ class AuthService: ObservableObject {
         self.currentUser = nil
         self.isAuthenticated = false
         UserDefaults.standard.removeObject(forKey: "auth_token")
+    }
+    
+    func prettyPrintJSON(_ data: Data) -> String? {
+        do {
+            let jsonObject = try JSONSerialization.jsonObject(with: data, options: [])
+            let prettyData = try JSONSerialization.data(
+                withJSONObject: jsonObject,
+                options: [.prettyPrinted]
+            )
+            return String(data: prettyData, encoding: .utf8)
+        } catch {
+            print("❌ JSON pretty print failed:", error)
+            return nil
+        }
     }
 }
 

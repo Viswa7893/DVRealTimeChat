@@ -71,12 +71,7 @@ struct ChatView: View {
         }
         .navigationTitle("Chat")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            viewModel.connect()
-        }
-        .onDisappear {
-            viewModel.disconnect()
-        }
+        // NO connect/disconnect calls - WebSocket is already connected globally
     }
     
     private func scrollToBottom(proxy: ScrollViewProxy) {

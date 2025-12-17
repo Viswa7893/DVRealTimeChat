@@ -13,6 +13,9 @@ class ChatService: ObservableObject {
     @Published var users: [UserPublicResponse] = []
     @Published var chatRooms: [ChatRoomResponse] = []
     
+    // Map user ID to chat room ID for quick lookup
+    private var userToChatRoomMap: [UUID: UUID] = [:]
+    
     private let baseURL = "http://127.0.0.1:8080/api"
     private let authService: AuthService
     
@@ -60,6 +63,9 @@ class ChatService: ObservableObject {
         
         let (data, _) = try await URLSession.shared.data(for: request)
         self.chatRooms = try decoder.decode([ChatRoomResponse].self, from: data)
+        
+        // Build user-to-chatroom mapping
+        buildUserToChatRoomMap()
     }
     
     func createChatRoom(with userId: UUID) async throws -> ChatRoomResponse {
@@ -77,7 +83,15 @@ class ChatService: ObservableObject {
         request.httpBody = try JSONEncoder().encode(body)
         
         let (data, _) = try await URLSession.shared.data(for: request)
-        return try decoder.decode(ChatRoomResponse.self, from: data)
+        let chatRoom = try decoder.decode(ChatRoomResponse.self, from: data)
+        
+        // Add to our local list
+        chatRooms.append(chatRoom)
+        
+        // Update mapping
+        buildUserToChatRoomMap()
+        
+        return chatRoom
     }
     
     // MARK: - Messages
@@ -93,6 +107,29 @@ class ChatService: ObservableObject {
         let (data, _) = try await URLSession.shared.data(for: request)
         return try decoder.decode([MessageResponse].self, from: data)
     }
+    
+    // MARK: - Helper Methods
+    
+    /// Get chat room ID for a specific user (for 1-on-1 chats)
+    func getChatRoomId(forUser userId: UUID) -> UUID? {
+        return userToChatRoomMap[userId]
+    }
+    
+    /// Build mapping of user IDs to chat room IDs for quick lookup
+    private func buildUserToChatRoomMap() {
+        guard let currentUserId = authService.currentUser?.id else { return }
+        
+        userToChatRoomMap.removeAll()
+        
+        for chatRoom in chatRooms where !chatRoom.isGroup {
+            // For 1-on-1 chats, find the other participant
+            if let otherUser = chatRoom.participants.first(where: { $0.id != currentUserId }) {
+                userToChatRoomMap[otherUser.id] = chatRoom.id
+            }
+        }
+        
+        print("📊 Built user-to-chatroom map: \(userToChatRoomMap.count) mappings")
+    }
 }
 
 // MARK: - Models
@@ -100,7 +137,7 @@ struct UserPublicResponse: Codable, Identifiable {
     let id: UUID
     let name: String
     let avatarURL: String?
-    let isOnline: Bool
+    var isOnline: Bool  // Changed to var for updating
     
     var stringId: String {
         id.uuidString

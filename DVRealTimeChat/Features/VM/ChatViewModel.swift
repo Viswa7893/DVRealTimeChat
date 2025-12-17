@@ -18,9 +18,10 @@ class ChatViewModel: ObservableObject {
     @Published private(set) var typingUsers: Set<String> = []
     @Published private(set) var onlineUsers: Set<String> = []
     @Published var messageText: String = ""
+    @Published var connectionError: String?
     
     // MARK: - Properties
-    private let webSocketManager: WebSocketManager
+    private let webSocketManager: WebSocketManager  // Global WebSocket - already connected
     private let currentUser: User
     private let chatRoom: ChatRoom
     private var cancellables = Set<AnyCancellable>()
@@ -29,7 +30,7 @@ class ChatViewModel: ObservableObject {
     // Track message send state
     private var pendingMessages: [String: Message] = [:]
     
-    // Auth token for WebSocket
+    // Auth token for API calls
     private var authToken: String?
     
     // MARK: - Initialization
@@ -45,6 +46,11 @@ class ChatViewModel: ObservableObject {
         self.authToken = authToken ?? UserDefaults.standard.string(forKey: "auth_token")
         
         setupSubscriptions()
+        
+        // Load message history on init
+        Task {
+            await loadMessageHistory()
+        }
     }
     
     // Expose only the current user's id for view access
@@ -52,7 +58,7 @@ class ChatViewModel: ObservableObject {
     
     // MARK: - Setup
     private func setupSubscriptions() {
-        // Subscribe to WebSocket messages
+        // Subscribe to WebSocket messages (global WebSocket is already connected)
         Task {
             for await event in await webSocketManager.messagePublisher.values {
                 await handleWebSocketEvent(event)
@@ -69,33 +75,42 @@ class ChatViewModel: ObservableObject {
     
     // MARK: - Public Methods
     
-    func connect() {
-        Task {
-            await webSocketManager.connect()
+    /// Load message history from server when chat opens
+    func loadMessageHistory() async {
+        do {
+            guard let token = authToken else { return }
             
-            // Authenticate after connection
-            if let token = authToken {
-                try? await authenticateWebSocket(token: token)
+            let url = URL(string: "http://127.0.0.1:8080/api/chat-rooms/\(chatRoom.id)/messages")!
+            var request = URLRequest(url: url)
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            
+            let (data, _) = try await URLSession.shared.data(for: request)
+            
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            decoder.dateDecodingStrategy = .iso8601
+            
+            let messageDTOs = try decoder.decode([MessageDTO].self, from: data)
+            
+            // Convert to local Message models
+            let historyMessages = messageDTOs.map { dto in
+                Message(
+                    id: dto.id.uuidString,
+                    senderId: dto.senderId.uuidString,
+                    senderName: dto.senderName,
+                    content: dto.content,
+                    timestamp: dto.timestamp,
+                    chatRoomId: dto.chatRoomId.uuidString,
+                    deliveryState: .delivered
+                )
             }
+            
+            self.messages = historyMessages
+            print("✅ Loaded \(historyMessages.count) messages from history")
+            
+        } catch {
+            print("❌ Failed to load message history: \(error)")
         }
-    }
-    
-    func disconnect() {
-        Task {
-            await webSocketManager.disconnect()
-        }
-    }
-    
-    private func authenticateWebSocket(token: String) async throws {
-        let authMessage: [String: String] = [
-            "type": "auth",
-            "token": token
-        ]
-        
-        let jsonData = try JSONSerialization.data(withJSONObject: authMessage)
-        let jsonString = String(data: jsonData, encoding: .utf8) ?? ""
-        
-        try await webSocketManager.sendText(jsonString)
     }
     
     func sendMessage() {
@@ -120,10 +135,9 @@ class ChatViewModel: ObservableObject {
         // Clear input
         messageText = ""
         
-        // Send to server
+        // Send to server via global WebSocket
         Task {
             do {
-                // Create a DTO for sending
                 let messageDTO: [String: Any] = [
                     "type": "message",
                     "content": message.content,
@@ -133,6 +147,7 @@ class ChatViewModel: ObservableObject {
                 let jsonData = try JSONSerialization.data(withJSONObject: messageDTO)
                 let jsonString = String(data: jsonData, encoding: .utf8) ?? ""
                 
+                print("📤 Sending message: \(message.content)")
                 try await webSocketManager.sendText(jsonString)
                 
                 // Update delivery state
@@ -158,7 +173,7 @@ class ChatViewModel: ObservableObject {
                 let jsonString = String(data: jsonData, encoding: .utf8) ?? ""
                 try await webSocketManager.sendText(jsonString)
             } catch {
-                print("❌ Failed to send typing indicator: \(error)")
+                print("⚠️ Failed to send typing indicator: \(error)")
             }
         }
     }
@@ -168,7 +183,6 @@ class ChatViewModel: ObservableObject {
         typingTimer?.invalidate()
 
         if !messageText.isEmpty {
-            // Send typing indicator on the main actor
             Task { @MainActor in
                 self.sendTypingIndicator(isTyping: true)
             }
@@ -180,7 +194,6 @@ class ChatViewModel: ObservableObject {
                     self.sendTypingIndicator(isTyping: false)
                 }
             }
-            // Ensure timer is scheduled on the main run loop
             RunLoop.main.add(typingTimer!, forMode: .common)
         } else {
             Task { @MainActor in
@@ -223,18 +236,25 @@ class ChatViewModel: ObservableObject {
     private func handleWebSocketEvent(_ event: WebSocketEvent) async {
         switch event {
         case .messageReceived(let message):
+            print("📬 Received message for room \(message.chatRoomId)")
+            
             // Only add message if it's for this chat room
-            guard message.chatRoomId == chatRoom.id else { return }
+            guard message.chatRoomId == chatRoom.id else {
+                print("⚠️ Message not for this room (this: \(chatRoom.id), msg: \(message.chatRoomId))")
+                return
+            }
             
             // Don't add if it's our own message (already added optimistically)
             if message.senderId != currentUser.id {
                 var mutableMessage = message
                 mutableMessage.deliveryState = .delivered
                 messages.append(mutableMessage)
+                print("✅ Added message from \(message.senderName)")
             } else {
                 // Our own message came back - mark as delivered
                 if let index = messages.firstIndex(where: { $0.id == message.id }) {
                     messages[index].deliveryState = .delivered
+                    print("✅ Our message delivered")
                 }
             }
             
@@ -259,12 +279,16 @@ class ChatViewModel: ObservableObject {
             
         case .error(let message):
             print("❌ WebSocket error: \(message)")
+            connectionError = message
             
         case .connected:
-            print("✅ Connected to chat")
+            print("✅ ChatViewModel: WebSocket is connected")
             
         case .disconnected:
-            print("🔌 Disconnected from chat")
+            print("🔌 ChatViewModel: WebSocket disconnected")
+            
+        case .userRegistered:
+            break
         }
     }
     
@@ -283,5 +307,17 @@ class ChatViewModel: ObservableObject {
     
     func isMessageFromCurrentUser(_ message: Message) -> Bool {
         message.senderId == currentUser.id
+    }
+}
+
+// MARK: - DTO for API calls
+extension ChatViewModel {
+    struct MessageDTO: Codable {
+        let id: UUID
+        let content: String
+        let senderId: UUID
+        let senderName: String
+        let chatRoomId: UUID
+        let timestamp: Date
     }
 }

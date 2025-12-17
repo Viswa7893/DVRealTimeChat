@@ -11,6 +11,11 @@ import SwiftUI
 struct DVRealTimeChatApp: App {
     @StateObject private var appState = AppState()
     
+    init() {
+        print("🚀 App Starting - Version 1.0.1")
+        print("🚀 AppState will be initialized next...")
+    }
+    
     var body: some Scene {
         WindowGroup {
             ContentView()

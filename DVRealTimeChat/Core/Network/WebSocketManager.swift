@@ -17,6 +17,7 @@ actor WebSocketManager {
         static let heartbeatInterval: TimeInterval = 30.0
         static let messageTimeout: TimeInterval = 10.0
         static let maxReconnectAttempts = 5
+        static let authTimeout: TimeInterval = 5.0
     }
     
     // MARK: - Properties
@@ -28,6 +29,7 @@ actor WebSocketManager {
     private var reconnectAttempts = 0
     private var reconnectTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
+    private var isAuthenticated = false
     
     // Publishers - Use PassthroughSubject for events
     private let messageSubject = PassthroughSubject<WebSocketEvent, Never>()
@@ -54,15 +56,17 @@ actor WebSocketManager {
     
     // MARK: - Public Methods
     
-    /// Connect to WebSocket server
-    func connect() async {
+    /// Connect to WebSocket server and authenticate
+    func connect(authToken: String) async throws {
         // Make sure we're not already connected
         guard connectionStateSubject.value == .disconnected else {
             print("⚠️ Already connected or connecting")
             return
         }
         
+        print("🔌 Starting WebSocket connection...")
         connectionStateSubject.send(.connecting)
+        isAuthenticated = false
                 
         // Create WebSocket task
         var request = URLRequest(url: serverURL)
@@ -72,20 +76,41 @@ actor WebSocketManager {
         webSocketTask?.resume()
         
         // Start listening for messages
-        await startListening()
+        Task {
+            await startListening()
+        }
         
-        // Start heartbeat
-        startHeartbeat()
+        // Wait a moment for connection to establish
+        try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
         
-        connectionStateSubject.send(.connected)
-        messageSubject.send(.connected)
-        reconnectAttempts = 0
+        // Send authentication message
+        print("🔐 Sending authentication...")
+        try await authenticate(token: authToken)
         
-        print("✅ WebSocket connected")
+        // Wait for authentication confirmation
+        let authResult = await waitForAuthentication()
+        
+        if authResult {
+            print("✅ WebSocket authenticated successfully")
+            connectionStateSubject.send(.connected)
+            messageSubject.send(.connected)
+            reconnectAttempts = 0
+            
+            // Start heartbeat only after successful authentication
+            startHeartbeat()
+        } else {
+            print("❌ Authentication failed or timed out")
+            await disconnect()
+            throw WebSocketError.authenticationFailed
+        }
     }
     
     /// Disconnect from WebSocket server
     func disconnect() async {
+        print("📌 Disconnecting WebSocket...")
+        
+        isAuthenticated = false
+        
         heartbeatTask?.cancel()
         heartbeatTask = nil
         
@@ -100,13 +125,12 @@ actor WebSocketManager {
             connectionStateSubject.send(.disconnected)
             messageSubject.send(.disconnected)
         }
-        
-        print("🔌 WebSocket disconnected")
     }
     
     /// Send a message through WebSocket
     func send<T: Encodable>(_ message: T) async throws {
-        guard let webSocketTask = webSocketTask else {
+        guard isAuthenticated, let webSocketTask = webSocketTask else {
+            print("❌ Cannot send: not authenticated")
             throw WebSocketError.notConnected
         }
         
@@ -121,7 +145,8 @@ actor WebSocketManager {
     
     /// Send text message
     func sendText(_ text: String) async throws {
-        guard let webSocketTask = webSocketTask else {
+        guard isAuthenticated, let webSocketTask = webSocketTask else {
+            print("❌ Cannot send: not authenticated")
             throw WebSocketError.notConnected
         }
         
@@ -130,6 +155,42 @@ actor WebSocketManager {
     }
     
     // MARK: - Private Methods
+    
+    private func authenticate(token: String) async throws {
+        let authMessage: [String: String] = [
+            "type": "auth",
+            "token": token
+        ]
+        
+        let jsonData = try JSONSerialization.data(withJSONObject: authMessage)
+        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
+            throw WebSocketError.encodingFailed
+        }
+        
+        guard let webSocketTask = webSocketTask else {
+            throw WebSocketError.notConnected
+        }
+        
+        let message = URLSessionWebSocketTask.Message.string(jsonString)
+        try await webSocketTask.send(message)
+    }
+    
+    private func waitForAuthentication() async -> Bool {
+        let startTime = Date()
+        
+        while !isAuthenticated {
+            // Check timeout
+            if Date().timeIntervalSince(startTime) > Config.authTimeout {
+                print("⏱️ Authentication timeout")
+                return false
+            }
+            
+            // Wait a bit before checking again
+            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+        }
+        
+        return true
+    }
     
     private func startListening() async {
         guard let webSocketTask = webSocketTask else { return }
@@ -160,7 +221,7 @@ actor WebSocketManager {
     }
     
     private func processTextMessage(_ text: String) async {
-        print("📥 Received text: \(text)")
+        print("📥 Received: \(text)")
         
         // Handle ping/pong
         if text == "ping" {
@@ -173,10 +234,9 @@ actor WebSocketManager {
             return
         }
         
-        // Handle plain text messages (like welcome message)
+        // Handle plain text messages
         if !text.starts(with: "{") && !text.starts(with: "[") {
-            print("📝 Plain text message: \(text)")
-            // You can handle plain text here or just ignore it
+            print("📝 Plain text: \(text)")
             return
         }
         
@@ -195,27 +255,33 @@ actor WebSocketManager {
         
         // First check if it's valid JSON
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            // Not valid JSON object - might be plain text or array
             if let plainText = String(data: data, encoding: .utf8) {
-                print("📝 Received non-JSON text: \(plainText)")
-            } else {
-                print("⚠️ Received invalid data")
+                print("📝 Non-JSON text: \(plainText)")
             }
             return
         }
         
         // Check for "type" field
         guard let type = json["type"] as? String else {
-            print("⚠️ JSON message missing 'type' field: \(json)")
+            print("⚠️ JSON missing 'type' field")
             return
         }
         
-        print("📨 Processing message type: \(type)")
+        print("📨 Message type: \(type)")
         
         switch type {
+        case "success":
+            // Authentication successful
+            if let message = json["message"] as? String,
+               message.contains("Authenticated") {
+                print("✅ Server confirmed authentication")
+                isAuthenticated = true
+            }
+            
         case "message":
             if let messageData = try? JSONSerialization.data(withJSONObject: json),
                let message = try? decoder.decode(Message.self, from: messageData) {
+                print("📬 Message from \(message.senderName): \(message.content)")
                 messageSubject.send(.messageReceived(message))
             } else {
                 print("⚠️ Failed to decode message")
@@ -234,12 +300,17 @@ actor WebSocketManager {
                 messageSubject.send(.userStatusChanged(userId: userId, isOnline: isOnline))
             }
             
+        case "userRegistered":
+            // New user registered - trigger user list refresh
+            print("👤 New user registered")
+            messageSubject.send(.userRegistered)
+            
         case "connected":
             print("✅ Server acknowledged connection")
-            messageSubject.send(.connected)
             
         case "error":
             if let errorMessage = json["message"] as? String {
+                print("❌ Server error: \(errorMessage)")
                 messageSubject.send(.error(errorMessage))
             }
             
@@ -250,6 +321,8 @@ actor WebSocketManager {
     
     private func handleConnectionError(_ error: Error) async {
         print("❌ WebSocket error: \(error.localizedDescription)")
+        
+        isAuthenticated = false
         
         let nsError = error as NSError
         
@@ -281,24 +354,20 @@ actor WebSocketManager {
             Config.maxReconnectDelay
         )
         
-        print("🔄 Reconnecting in \(delay) seconds (attempt \(reconnectAttempts)/\(Config.maxReconnectAttempts))")
+        print("🔄 Reconnecting in \(delay)s (attempt \(reconnectAttempts)/\(Config.maxReconnectAttempts))")
         
-        reconnectTask = Task {
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            
-            guard !Task.isCancelled else { return }
-            await connect()
-        }
+        // Note: Cannot auto-reconnect without auth token
+        // The view must call connect(authToken:) again
     }
     
     private func startHeartbeat() {
         heartbeatTask?.cancel()
         
         heartbeatTask = Task {
-            while !Task.isCancelled {
+            while !Task.isCancelled && isAuthenticated {
                 try? await Task.sleep(nanoseconds: UInt64(Config.heartbeatInterval * 1_000_000_000))
                 
-                guard !Task.isCancelled else { break }
+                guard !Task.isCancelled, isAuthenticated else { break }
                 
                 do {
                     try await sendText("ping")
@@ -321,6 +390,7 @@ enum WebSocketError: LocalizedError {
     case decodingFailed
     case timeout
     case connectionClosed
+    case authenticationFailed
     
     var errorDescription: String? {
         switch self {
@@ -330,7 +400,7 @@ enum WebSocketError: LocalizedError {
         case .decodingFailed: return "Failed to decode message"
         case .timeout: return "Request timed out"
         case .connectionClosed: return "Connection closed unexpectedly"
+        case .authenticationFailed: return "Authentication failed"
         }
     }
 }
-
